@@ -2889,83 +2889,89 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
         object.analyzed = true;
     }
 
-    var it = section_metadata.iterator();
-    while (it.next()) |entry| {
-        const match = entry.key_ptr.*;
-        const metadata = entry.value_ptr.*;
-        const seg = &self.load_commands.items[match.seg].Segment;
-        const sect = &seg.sections.items[match.sect];
-        log.debug("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
-            commands.segmentName(sect.*),
-            commands.sectionName(sect.*),
-            metadata.size,
-            metadata.alignment,
-        });
+    for (self.load_commands.items) |*lc, seg_id| {
+        if (lc.* != .Segment) break;
+        const seg = &lc.Segment;
 
-        const sect_size = if (self.atoms.get(match)) |last| blk: {
-            const last_atom_sym = self.locals.items[last.local_sym_index];
-            break :blk last_atom_sym.n_value + last.size - sect.addr;
-        } else 0;
+        for (seg.sections.items) |*sect, sect_id| {
+            const match = MatchingSection{
+                .seg = @intCast(u16, seg_id),
+                .sect = @intCast(u16, sect_id),
+            };
+            const metadata = section_metadata.get(match) orelse continue;
 
-        sect.@"align" = math.max(sect.@"align", metadata.alignment);
-        const needed_size = @intCast(u32, metadata.size + sect_size);
-        // TODO does release mode in stage2 need a file copy?
-        const use_stage1 = build_options.is_stage1 and self.base.options.use_stage1;
-        const needs_file_copy = !use_stage1;
-        try self.growSection(match, needed_size, needs_file_copy);
-        sect.size = needed_size;
-
-        var base_vaddr = if (self.atoms.get(match)) |last| blk: {
-            const last_atom_sym = self.locals.items[last.local_sym_index];
-            break :blk last_atom_sym.n_value + last.size;
-        } else sect.addr;
-        const n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-
-        var atom = first_atoms.get(match).?;
-        while (true) {
-            const alignment = try math.powi(u32, 2, atom.alignment);
-            base_vaddr = mem.alignForwardGeneric(u64, base_vaddr, alignment);
-
-            const sym = &self.locals.items[atom.local_sym_index];
-            sym.n_value = base_vaddr;
-            sym.n_sect = n_sect;
-
-            log.debug("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
-                self.getString(sym.n_strx),
-                base_vaddr,
-                base_vaddr + atom.size,
-                atom.size,
-                atom.alignment,
+            log.debug("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
+                commands.segmentName(sect.*),
+                commands.sectionName(sect.*),
+                metadata.size,
+                metadata.alignment,
             });
 
-            // Update each alias (if any)
-            for (atom.aliases.items) |index| {
-                const alias_sym = &self.locals.items[index];
-                alias_sym.n_value = base_vaddr;
-                alias_sym.n_sect = n_sect;
+            const sect_size = if (self.atoms.get(match)) |last| blk: {
+                const last_atom_sym = self.locals.items[last.local_sym_index];
+                break :blk last_atom_sym.n_value + last.size - sect.addr;
+            } else 0;
+
+            sect.@"align" = math.max(sect.@"align", metadata.alignment);
+            const needed_size = @intCast(u32, metadata.size + sect_size);
+            // TODO does release mode in stage2 need a file copy?
+            const use_stage1 = build_options.is_stage1 and self.base.options.use_stage1;
+            const needs_file_copy = !use_stage1;
+            try self.growSection(match, needed_size, needs_file_copy);
+            sect.size = needed_size;
+
+            var base_vaddr = if (self.atoms.get(match)) |last| blk: {
+                const last_atom_sym = self.locals.items[last.local_sym_index];
+                break :blk last_atom_sym.n_value + last.size;
+            } else sect.addr;
+            const n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+
+            var atom = first_atoms.get(match).?;
+            while (true) {
+                const alignment = try math.powi(u32, 2, atom.alignment);
+                base_vaddr = mem.alignForwardGeneric(u64, base_vaddr, alignment);
+
+                const sym = &self.locals.items[atom.local_sym_index];
+                sym.n_value = base_vaddr;
+                sym.n_sect = n_sect;
+
+                log.debug("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
+                    self.getString(sym.n_strx),
+                    base_vaddr,
+                    base_vaddr + atom.size,
+                    atom.size,
+                    atom.alignment,
+                });
+
+                // Update each alias (if any)
+                for (atom.aliases.items) |index| {
+                    const alias_sym = &self.locals.items[index];
+                    alias_sym.n_value = base_vaddr;
+                    alias_sym.n_sect = n_sect;
+                }
+
+                // Update each symbol contained within the atom
+                for (atom.contained.items) |sym_at_off| {
+                    const contained_sym = &self.locals.items[sym_at_off.local_sym_index];
+                    contained_sym.n_value = base_vaddr + sym_at_off.offset;
+                    contained_sym.n_sect = n_sect;
+                }
+
+                base_vaddr += atom.size;
+
+                if (atom.next) |next| {
+                    atom = next;
+                } else break;
             }
 
-            // Update each symbol contained within the atom
-            for (atom.contained.items) |sym_at_off| {
-                const contained_sym = &self.locals.items[sym_at_off.local_sym_index];
-                contained_sym.n_value = base_vaddr + sym_at_off.offset;
-                contained_sym.n_sect = n_sect;
+            if (self.atoms.getPtr(match)) |last| {
+                const first_atom = first_atoms.get(match).?;
+                last.*.next = first_atom;
+                first_atom.prev = last.*;
+                last.* = first_atom;
             }
-
-            base_vaddr += atom.size;
-
-            if (atom.next) |next| {
-                atom = next;
-            } else break;
+            _ = try self.atoms.put(self.base.allocator, match, parsed_atoms.get(match).?);
         }
-
-        if (self.atoms.getPtr(match)) |last| {
-            const first_atom = first_atoms.get(match).?;
-            last.*.next = first_atom;
-            first_atom.prev = last.*;
-            last.* = first_atom;
-        }
-        _ = try self.atoms.put(self.base.allocator, match, parsed_atoms.get(match).?);
     }
 }
 
@@ -3701,6 +3707,8 @@ pub fn getDeclVAddr(self: *MachO, decl: *const Module.Decl) u64 {
 }
 
 pub fn populateMissingMetadata(self: *MachO) !void {
+    const cpu_arch = self.base.options.target.cpu.arch;
+
     if (self.pagezero_segment_cmd_index == null) {
         self.pagezero_segment_cmd_index = @intCast(u16, self.load_commands.items.len);
         try self.load_commands.append(self.base.allocator, .{
@@ -3739,7 +3747,7 @@ pub fn populateMissingMetadata(self: *MachO) !void {
     }
 
     if (self.text_section_index == null) {
-        const alignment: u2 = switch (self.base.options.target.cpu.arch) {
+        const alignment: u2 = switch (cpu_arch) {
             .x86_64 => 0,
             .aarch64 => 2,
             else => unreachable, // unhandled architecture type
@@ -3757,12 +3765,12 @@ pub fn populateMissingMetadata(self: *MachO) !void {
     }
 
     if (self.stubs_section_index == null) {
-        const alignment: u2 = switch (self.base.options.target.cpu.arch) {
+        const alignment: u2 = switch (cpu_arch) {
             .x86_64 => 0,
             .aarch64 => 2,
             else => unreachable, // unhandled architecture type
         };
-        const stub_size: u4 = switch (self.base.options.target.cpu.arch) {
+        const stub_size: u4 = switch (cpu_arch) {
             .x86_64 => 6,
             .aarch64 => 3 * @sizeOf(u32),
             else => unreachable, // unhandled architecture type
@@ -3781,17 +3789,17 @@ pub fn populateMissingMetadata(self: *MachO) !void {
     }
 
     if (self.stub_helper_section_index == null) {
-        const alignment: u2 = switch (self.base.options.target.cpu.arch) {
+        const alignment: u2 = switch (cpu_arch) {
             .x86_64 => 0,
             .aarch64 => 2,
             else => unreachable, // unhandled architecture type
         };
-        const preamble_size: u6 = switch (self.base.options.target.cpu.arch) {
+        const preamble_size: u6 = switch (cpu_arch) {
             .x86_64 => 15,
             .aarch64 => 6 * @sizeOf(u32),
             else => unreachable,
         };
-        const stub_size: u4 = switch (self.base.options.target.cpu.arch) {
+        const stub_size: u4 = switch (cpu_arch) {
             .x86_64 => 10,
             .aarch64 => 3 * @sizeOf(u32),
             else => unreachable,
@@ -4273,10 +4281,12 @@ fn growSegment(self: *MachO, seg_id: u16, new_size: u64, needs_file_copy: bool) 
 
     // TODO We should probably nop the expanded by distance, or put 0s.
 
-    // TODO copyRangeAll doesn't automatically extend the file on macOS.
-    const ledit_seg = &self.load_commands.items[self.linkedit_segment_cmd_index.?].Segment;
-    const new_filesize = offset_amt + ledit_seg.inner.fileoff + ledit_seg.inner.filesize;
-    try self.base.file.?.pwriteAll(&[_]u8{0}, new_filesize - 1);
+    if (needs_file_copy) {
+        // TODO copyRangeAll doesn't automatically extend the file on macOS.
+        const ledit_seg = &self.load_commands.items[self.linkedit_segment_cmd_index.?].Segment;
+        const new_filesize = offset_amt + ledit_seg.inner.fileoff + ledit_seg.inner.filesize;
+        try self.base.file.?.pwriteAll(&[_]u8{0}, new_filesize - 1);
+    }
 
     var next: usize = seg_id + 1;
     while (next < self.linkedit_segment_cmd_index.? + 1) : (next += 1) {
