@@ -2909,7 +2909,10 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
 
         sect.@"align" = math.max(sect.@"align", metadata.alignment);
         const needed_size = @intCast(u32, metadata.size + sect_size);
-        try self.growSection(match, needed_size);
+        // TODO does release mode in stage2 need a file copy?
+        const use_stage1 = build_options.is_stage1 and self.base.options.use_stage1;
+        const needs_file_copy = !use_stage1;
+        try self.growSection(match, needed_size, needs_file_copy);
         sect.size = needed_size;
 
         var base_vaddr = if (self.atoms.get(match)) |last| blk: {
@@ -4248,12 +4251,16 @@ fn findFreeSpace(self: MachO, segment_id: u16, alignment: u64, start: ?u64) u64 
     return mem.alignForwardGeneric(u64, final_off, alignment);
 }
 
-fn growSegment(self: *MachO, seg_id: u16, new_size: u64) !void {
+fn growSegment(self: *MachO, seg_id: u16, new_size: u64, needs_file_copy: bool) !void {
     const seg = &self.load_commands.items[seg_id].Segment;
     const new_seg_size = mem.alignForwardGeneric(u64, new_size, self.page_size);
     assert(new_seg_size > seg.inner.filesize);
     const offset_amt = new_seg_size - seg.inner.filesize;
-    log.debug("growing segment {s} from 0x{x} to 0x{x}", .{ seg.inner.segname, seg.inner.filesize, new_seg_size });
+    log.debug("growing segment {s} from 0x{x} to 0x{x}", .{
+        seg.inner.segname,
+        seg.inner.filesize,
+        new_seg_size,
+    });
     seg.inner.filesize = new_seg_size;
     seg.inner.vmsize = new_seg_size;
 
@@ -4274,12 +4281,14 @@ fn growSegment(self: *MachO, seg_id: u16, new_size: u64) !void {
     var next: usize = seg_id + 1;
     while (next < self.linkedit_segment_cmd_index.? + 1) : (next += 1) {
         const next_seg = &self.load_commands.items[next].Segment;
-        _ = try self.base.file.?.copyRangeAll(
-            next_seg.inner.fileoff,
-            self.base.file.?,
-            next_seg.inner.fileoff + offset_amt,
-            next_seg.inner.filesize,
-        );
+        if (needs_file_copy) {
+            _ = try self.base.file.?.copyRangeAll(
+                next_seg.inner.fileoff,
+                self.base.file.?,
+                next_seg.inner.fileoff + offset_amt,
+                next_seg.inner.filesize,
+            );
+        }
         next_seg.inner.fileoff += offset_amt;
         next_seg.inner.vmaddr += offset_amt;
 
@@ -4312,7 +4321,7 @@ fn growSegment(self: *MachO, seg_id: u16, new_size: u64) !void {
     }
 }
 
-fn growSection(self: *MachO, match: MatchingSection, new_size: u32) !void {
+fn growSection(self: *MachO, match: MatchingSection, new_size: u32, needs_file_copy: bool) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -4329,7 +4338,7 @@ fn growSection(self: *MachO, match: MatchingSection, new_size: u32) !void {
 
         if (match.sect == seg.sections.items.len - 1) {
             // Last section, just grow segments
-            try self.growSegment(match.seg, seg.inner.filesize + needed_size - max_size);
+            try self.growSegment(match.seg, seg.inner.filesize + needed_size - max_size, needs_file_copy);
             break :blk;
         }
 
@@ -4349,19 +4358,20 @@ fn growSection(self: *MachO, match: MatchingSection, new_size: u32) !void {
         if (last_sect_off + offset_amt > seg_off) {
             // Need to grow segment first.
             const spill_size = (last_sect_off + offset_amt) - seg_off;
-            try self.growSegment(match.seg, seg.inner.filesize + spill_size);
+            try self.growSegment(match.seg, seg.inner.filesize + spill_size, needs_file_copy);
         }
-
-        // We have enough space to expand within the segment, so move all sections by
-        // the required amount and update their header offsets.
-        const next_sect = seg.sections.items[match.sect + 1];
-        const total_size = last_sect_off - next_sect.offset;
-        _ = try self.base.file.?.copyRangeAll(
-            next_sect.offset,
-            self.base.file.?,
-            next_sect.offset + offset_amt,
-            total_size,
-        );
+        if (needs_file_copy) {
+            // We have enough space to expand within the segment, so move all sections by
+            // the required amount and update their header offsets.
+            const next_sect = seg.sections.items[match.sect + 1];
+            const total_size = last_sect_off - next_sect.offset;
+            _ = try self.base.file.?.copyRangeAll(
+                next_sect.offset,
+                self.base.file.?,
+                next_sect.offset + offset_amt,
+                total_size,
+            );
+        }
 
         var next = match.sect + 1;
         while (next < seg.sections.items.len) : (next += 1) {
@@ -4482,7 +4492,7 @@ fn allocateAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, m
     const expand_section = atom_placement == null or atom_placement.?.next == null;
     if (expand_section) {
         const needed_size = @intCast(u32, (vaddr + new_atom_size) - sect.addr);
-        try self.growSection(match, needed_size);
+        try self.growSection(match, needed_size, true);
         _ = try self.atoms.put(self.base.allocator, match, atom);
         sect.size = needed_size;
         self.load_commands_dirty = true;
